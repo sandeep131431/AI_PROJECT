@@ -1,0 +1,28 @@
+{
+  "invoice_number": "INV-ERP-004",
+  "vendor_id": "V002",
+  "vendor_name": "Global Transport Ltd",
+  "po_number": "PO1002",
+  "invoice_date": "2026-11-18",
+  "currency": "INR",
+  "line_items": [
+    {
+      "sku_code": "SKU002",
+      "description": "Shipping Tape",
+      "quantity": 5,
+      "unit_price": 50.0,
+      "line_total": 250.0
+    },
+    {
+      "sku_code": "SKU003",
+      "description": "Packing Material",
+      "quantity": 2,
+      "unit_price": 200.0,
+      "line_total": 400.0
+    }
+  ],
+  "subtotal": 650.0,
+  "gst_rate_percent": 18,
+  "gst_amount": 117.0,
+  "total_amount": 767.0
+}

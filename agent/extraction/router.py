@@ -16,32 +16,38 @@ from agent.database.save_invoice import (
     save_invoice
 )
 
+from agent.validation.db_validator import run_validation
+from agent.validation.erp_validator import run_erp_validation
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 INCOMING_FOLDER = PROJECT_ROOT / "incoming"
 
+
+# --------------------------------------------------
+# 1. File Extraction Router
+# --------------------------------------------------
 
 def route_file(file_info):
 
     file_path = file_info["file_path"]
     extension = Path(file_path).suffix.lower()
 
-    # Step 1: Checksum status
+    # Check checksum status
 
-    if file_info["status"] != "SUCCESS":
+    if file_info.get("status") != "SUCCESS":
+
         return {
             **file_info,
-            "raw_text": None,
-            "language": None,
-            "translated_text": None,
-            "invoice_data": None,
             "extraction_status": "FAILED",
             "field_extraction_status": "SKIPPED",
             "database_status": "SKIPPED",
+            "validation_status": "SKIPPED",
+            "erp_validation_status": "SKIPPED",
             "error": file_info.get("error", "Checksum failed")
         }
 
-    # Step 2: Check duplicate in Neon DB
+    # Check existing invoice
 
     existing_invoice_id = find_existing_checksum(
         file_info.get("checksum")
@@ -54,20 +60,20 @@ def route_file(file_info):
             "extraction_status": "SKIPPED",
             "field_extraction_status": "SKIPPED",
             "database_status": "DUPLICATE",
-            "existing_invoice_id": existing_invoice_id,
-            "message": "Invoice already processed"
+            "invoice_id": existing_invoice_id,
+            "message": "Invoice already exists"
         }
 
-    # Step 3: File Extraction
+    # Extract document
 
     if extension == ".pdf":
-        result = extract_pdf(file_path)
+        extraction_result = extract_pdf(file_path)
 
     elif extension == ".docx":
-        result = extract_docx(file_path)
+        extraction_result = extract_docx(file_path)
 
     elif extension in {".png", ".jpg", ".jpeg", ".tiff", ".bmp"}:
-        result = extract_image(file_path)
+        extraction_result = extract_image(file_path)
 
     else:
         return {
@@ -75,44 +81,44 @@ def route_file(file_info):
             "extraction_status": "SKIPPED",
             "field_extraction_status": "SKIPPED",
             "database_status": "SKIPPED",
+            "validation_status": "SKIPPED",
+            "erp_validation_status": "SKIPPED",
             "message": "Unsupported file format"
         }
 
-    if result["status"] != "SUCCESS":
+    if extraction_result.get("status") != "SUCCESS":
 
         return {
             **file_info,
-            **result,
             "extraction_status": "FAILED",
             "field_extraction_status": "SKIPPED",
-            "database_status": "SKIPPED"
+            "database_status": "SKIPPED",
+            "validation_status": "SKIPPED",
+            "erp_validation_status": "SKIPPED",
+            "error": extraction_result.get("error")
         }
 
-    raw_text = result["raw_text"]
+    raw_text = extraction_result["raw_text"]
 
-    # Step 4: Language Detection
+    # Language detection
 
     language_result = detect_language(raw_text)
 
-    if language_result["status"] != "SUCCESS":
+    if language_result.get("status") != "SUCCESS":
 
         return {
             **file_info,
-            **result,
-            "language": None,
-            "translated_text": None,
-            "invoice_data": None,
             "extraction_status": "SUCCESS",
-            "language_status": "FAILED",
-            "translation_status": "SKIPPED",
             "field_extraction_status": "SKIPPED",
             "database_status": "SKIPPED",
+            "validation_status": "SKIPPED",
+            "erp_validation_status": "SKIPPED",
             "language_error": language_result.get("error")
         }
 
     language = language_result["language_code"]
 
-    # Step 5: Translation
+    # Translation
 
     translation_result = translate_to_english(
         raw_text,
@@ -121,25 +127,29 @@ def route_file(file_info):
 
     translated_text = translation_result.get("translated_text")
 
-    # Step 6: Structured Field Extraction
+    if (
+        translation_result.get("status") != "SUCCESS"
+        or not translated_text
+    ):
 
-    if translated_text:
-
-        field_result = extract_invoice_fields(translated_text)
-
-    else:
-
-        field_result = {
-            "invoice_data": None,
-            "status": "SKIPPED",
-            "error": "Translated text not available"
+        return {
+            **file_info,
+            "extraction_status": "SUCCESS",
+            "language": language,
+            "translation_status": "FAILED",
+            "field_extraction_status": "SKIPPED",
+            "database_status": "SKIPPED",
+            "validation_status": "SKIPPED",
+            "erp_validation_status": "SKIPPED",
+            "translation_error": translation_result.get("error")
         }
 
-    # Step 7: Prepare final result
+    # Field extraction
 
-    final_result = {
+    field_result = extract_invoice_fields(translated_text)
+
+    return {
         **file_info,
-        **result,
 
         "raw_text": raw_text,
 
@@ -147,8 +157,7 @@ def route_file(file_info):
         "language_status": "SUCCESS",
 
         "translated_text": translated_text,
-        "translation_status": translation_result.get("status"),
-        "translation_error": translation_result.get("error"),
+        "translation_status": "SUCCESS",
 
         "invoice_data": field_result.get("invoice_data"),
         "field_extraction_status": field_result.get("status"),
@@ -157,8 +166,70 @@ def route_file(file_info):
         "extraction_status": "SUCCESS"
     }
 
-    return final_result
 
+# --------------------------------------------------
+# 2. Internal + ERP Validation
+# --------------------------------------------------
+
+def validate_invoice_pipeline(invoice_id):
+
+    result = {}
+
+    # Internal validation
+
+    try:
+
+        internal_result = run_validation(invoice_id)
+
+        result["validation_status"] = internal_result.get("status")
+        result["validation_errors"] = internal_result.get("errors", [])
+        result["total_validation_errors"] = internal_result.get(
+            "total_errors", 0
+        )
+
+    except Exception as error:
+
+        result["validation_status"] = "ERROR"
+        result["validation_error"] = str(error)
+
+        result["erp_validation_status"] = "SKIPPED"
+
+        return result
+
+    # ERP validation
+
+    if result["validation_status"] != "PASSED":
+
+        result["erp_validation_status"] = "SKIPPED"
+        result["erp_validation_message"] = (
+            "ERP validation skipped because internal validation failed"
+        )
+
+        return result
+
+    try:
+
+        erp_result = run_erp_validation(invoice_id)
+
+        result["erp_validation_status"] = erp_result.get("status")
+        result["total_discrepancies"] = erp_result.get(
+            "total_discrepancies", 0
+        )
+        result["erp_discrepancies"] = erp_result.get(
+            "discrepancies", []
+        )
+
+    except Exception as error:
+
+        result["erp_validation_status"] = "ERROR"
+        result["erp_validation_error"] = str(error)
+
+    return result
+
+
+# --------------------------------------------------
+# 3. Main Router
+# --------------------------------------------------
 
 def run_extraction_router():
 
@@ -172,23 +243,39 @@ def run_extraction_router():
 
     for file_info in monitored_files:
 
-        print(f"\nProcessing: {file_info['file_name']}")
+        print("\nProcessing:", file_info.get("file_name"))
 
         try:
 
             result = route_file(file_info)
 
-            # Step 8: Save invoice into Neon DB
+            # Save new invoice
 
             if result.get("field_extraction_status") == "SUCCESS":
 
                 database_result = save_invoice(result)
 
                 result["database_status"] = database_result.get("status")
-
                 result["database_message"] = database_result.get("message")
-
                 result["invoice_id"] = database_result.get("invoice_id")
+
+            # Validate both new and existing saved invoices
+
+            if (
+                result.get("database_status") in {"SUCCESS", "DUPLICATE"}
+                and result.get("invoice_id")
+            ):
+
+                validation_result = validate_invoice_pipeline(
+                    result["invoice_id"]
+                )
+
+                result.update(validation_result)
+
+            else:
+
+                result.setdefault("validation_status", "SKIPPED")
+                result.setdefault("erp_validation_status", "SKIPPED")
 
             results.append(result)
 
@@ -199,12 +286,16 @@ def run_extraction_router():
                 "extraction_status": "FAILED",
                 "field_extraction_status": "FAILED",
                 "database_status": "FAILED",
+                "validation_status": "SKIPPED",
+                "erp_validation_status": "SKIPPED",
                 "error": str(error)
             }
 
             results.append(result)
 
-        # Step 9: Print results
+        # Print individual result
+
+        print("\n---------- RESULT ----------")
 
         print("Checksum:", result.get("checksum"))
         print("Extraction:", result.get("extraction_status"))
@@ -212,25 +303,35 @@ def run_extraction_router():
         print("Translation:", result.get("translation_status"))
         print("Field Extraction:", result.get("field_extraction_status"))
         print("Database:", result.get("database_status"))
+        print("Invoice ID:", result.get("invoice_id"))
 
-        if result.get("invoice_id"):
-            print("Invoice ID:", result["invoice_id"])
+        print("Internal Validation:", result.get("validation_status"))
+        print("ERP Validation:", result.get("erp_validation_status"))
 
-        if result.get("invoice_data"):
+        print(
+            "Total Discrepancies:",
+            result.get("total_discrepancies", 0)
+        )
 
-            print("\nStructured Invoice Data:")
+        if result.get("validation_errors"):
 
-            for key, value in result["invoice_data"].items():
-                print(f"{key}: {value}")
+            print("\nInternal Validation Errors:")
+
+            for error in result["validation_errors"]:
+                print("-", error)
+
+        if result.get("erp_discrepancies"):
+
+            print("\nERP Discrepancies:")
+
+            for discrepancy in result["erp_discrepancies"]:
+                print("-", discrepancy)
 
         if result.get("error"):
             print("Error:", result["error"])
 
-        if result.get("translation_error"):
-            print("Translation Error:", result["translation_error"])
-
-        if result.get("field_extraction_error"):
-            print("Field Extraction Error:", result["field_extraction_error"])
+        if result.get("erp_validation_error"):
+            print("ERP Error:", result["erp_validation_error"])
 
         if result.get("database_message"):
             print("Database Message:", result["database_message"])
@@ -240,40 +341,61 @@ def run_extraction_router():
     return results
 
 
+# --------------------------------------------------
+# 4. Summary
+# --------------------------------------------------
+
 if __name__ == "__main__":
 
     results = run_extraction_router()
 
-    successful = sum(
-        1 for item in results
-        if item.get("extraction_status") == "SUCCESS"
-    )
-
-    failed = sum(
-        1 for item in results
-        if item.get("extraction_status") == "FAILED"
-    )
-
-    field_successful = sum(
-        1 for item in results
-        if item.get("field_extraction_status") == "SUCCESS"
-    )
-
-    database_successful = sum(
-        1 for item in results
-        if item.get("database_status") == "SUCCESS"
-    )
-
-    duplicates = sum(
-        1 for item in results
-        if item.get("database_status") == "DUPLICATE"
-    )
-
     print("\n========== SUMMARY ==========")
 
     print("Total Files:", len(results))
-    print("Successful Extraction:", successful)
-    print("Failed Extraction:", failed)
-    print("Successful Field Extraction:", field_successful)
-    print("Database Saved:", database_successful)
-    print("Duplicate Files:", duplicates)
+
+    print(
+        "Successful Extraction:",
+        sum(1 for r in results if r.get("extraction_status") == "SUCCESS")
+    )
+
+    print(
+        "Failed Extraction:",
+        sum(1 for r in results if r.get("extraction_status") == "FAILED")
+    )
+
+    print(
+        "Database Saved:",
+        sum(1 for r in results if r.get("database_status") == "SUCCESS")
+    )
+
+    print(
+        "Duplicate Files:",
+        sum(1 for r in results if r.get("database_status") == "DUPLICATE")
+    )
+
+    print(
+        "Internal Validation Passed:",
+        sum(1 for r in results if r.get("validation_status") == "PASSED")
+    )
+
+    print(
+        "Internal Validation Failed:",
+        sum(1 for r in results if r.get("validation_status") == "FAILED")
+    )
+
+    print(
+        "ERP Validation Passed:",
+        sum(1 for r in results if r.get("erp_validation_status") == "PASSED")
+    )
+
+    print(
+        "ERP Validation Failed:",
+        sum(1 for r in results if r.get("erp_validation_status") == "FAILED")
+    )
+
+    print(
+        "ERP Validation Errors:",
+        sum(1 for r in results if r.get("erp_validation_status") == "ERROR")
+    )
+
+    print("\n========== PROCESS COMPLETED ==========\n")
